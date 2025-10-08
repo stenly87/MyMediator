@@ -38,20 +38,6 @@ namespace MyMediator.Types
 
             var result = await (Task<TResponse>)method.Invoker.Invoke(handler, new object[] { request, ct })!;
             return result;
-        }
-
-        public static void RegisterHandlers(IServiceCollection services, Assembly assembly)
-        {
-            foreach (var type in assembly.GetTypes())
-            {
-                foreach (var iface in type.GetInterfaces()
-                             .Where(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IRequestHandler<,>)))
-                {
-                    services.AddTransient(iface, type);
-                }
-            }
-        }
-
-        
+        }        
     }
 }
