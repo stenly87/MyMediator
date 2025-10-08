@@ -6,6 +6,11 @@ namespace MyMediator.Extension
 {
     public static class ServiceCollectionExtension
     {
+        /// <summary>
+        /// Метод добавит в контейнер зависимостей все классы, реализующие IRequestHandler
+        /// </summary>
+        /// <param name="services">Стандартный DI</param>
+        /// <param name="assembly">Сборка, в которой лежат хэндлеры</param>
         public static void AddMediatorHandlers(this IServiceCollection services, Assembly assembly)
         {
             foreach (var type in assembly.GetTypes())
