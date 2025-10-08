@@ -1,6 +1,4 @@
-﻿using MyMediator.Types;
-
-namespace MyMediator.Interfaces
+﻿namespace MyMediator.Interfaces
 {
     public interface IMediator
     {
