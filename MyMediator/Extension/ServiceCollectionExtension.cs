@@ -11,7 +11,7 @@ namespace MyMediator.Extension
 {
     public static class ServiceCollectionExtension
     {
-        public static void RegisterMediatorHandlers(this IServiceCollection services, Assembly assembly)
+        public static void AddMediatorHandlers(this IServiceCollection services, Assembly assembly)
         {
             foreach (var type in assembly.GetTypes())
             {
