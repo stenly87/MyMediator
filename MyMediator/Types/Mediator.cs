@@ -1,5 +1,5 @@
 ﻿using MyMediator.Interfaces;
-using System.Collections.Concurrent;
+using System.Linq.Expressions;
 using System.Reflection;
 
 namespace MyMediator.Types
@@ -14,8 +14,6 @@ namespace MyMediator.Types
         public Mediator(IServiceProvider serviceProvider)
             => _serviceProvider = serviceProvider;
 
-        private static readonly ConcurrentDictionary<Type, (Type, MethodInfo)> _handleMethods = new();
-
         /// <summary>
         /// Перегрузка для команд, реализующих IRequest<Unit>
         /// </summary>
@@ -26,7 +24,7 @@ namespace MyMediator.Types
             => SendAsync<Unit>(command, ct);
 
         /// <summary>
-        /// Реализация паттера Медиатор. Вызывается хэндлер, соответствующий команде из аргумента request
+        /// Реализация паттерна Медиатор. Вызывается хэндлер, соответствующий команде из аргумента request
         /// </summary>
         /// <typeparam name="TResponse">Тип ответа</typeparam>
         /// <param name="request">Команда</param>
@@ -36,23 +34,38 @@ namespace MyMediator.Types
         public async Task<TResponse> SendAsync<TResponse>(IRequest<TResponse> request, CancellationToken ct = default)
         {
             var requestType = request.GetType();
-            
-            (Type ServiceType, MethodInfo Invoker) method = _handleMethods.GetOrAdd(requestType, t =>
-            {
-                var responseType = typeof(TResponse);
-                var concreteHandlerType = typeof(IRequestHandler<,>).MakeGenericType(t, responseType);
-                var handleMethod = concreteHandlerType.GetMethod("HandleAsync")
-                    ?? throw new InvalidOperationException($"Handler for {t} must implement HandleAsync.");
 
-                return (concreteHandlerType, handleMethod);
+            var method = HandlerCache<TResponse>.GetOrAdd(requestType, () =>
+            {
+                var concreteHandlerType = typeof(IRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse));
+                var handleMethod = concreteHandlerType.GetMethod("HandleAsync")
+                    ?? throw new InvalidOperationException($"Handler for {requestType} must implement HandleAsync.");
+                var run = CreateHandlerDelegate<TResponse>(requestType, concreteHandlerType, handleMethod);
+                return (concreteHandlerType, run);
             });
             
-            var handler = _serviceProvider.GetService(method.ServiceType);
+            var handler = _serviceProvider.GetService(method.Handler);
             if (handler == null)
                 throw new InvalidOperationException($"Handler for {requestType} is not registered.");
 
-            var result = await (Task<TResponse>)method.Invoker.Invoke(handler, [request, ct])!;
-            return result;
-        }        
+            return await method.Invoke(handler, request, ct);
+        }
+
+        private static Func<object, object, CancellationToken, Task<TResponse>> CreateHandlerDelegate<TResponse>(
+            Type requestType, Type handlerType, MethodInfo method)
+        {
+            var h = Expression.Parameter(typeof(object), "h");
+            var r = Expression.Parameter(typeof(object), "r");
+            var c = Expression.Parameter(typeof(CancellationToken), "c");
+
+            var call = Expression.Call(
+                Expression.Convert(h, handlerType),
+                method,
+                Expression.Convert(r, requestType),
+                c
+            );
+
+            return Expression.Lambda<Func<object, object, CancellationToken, Task<TResponse>>>(call, h, r, c).Compile();
+        }
     }
 }
