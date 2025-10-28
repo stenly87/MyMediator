@@ -7,7 +7,7 @@ namespace MediatorUseSample.Commands.ValidateCommand
         public async Task<IEnumerable<string>> ValidateAsync(TestCalcCommand request, CancellationToken ct)
         {
             var result = new List<string>();
-            if (request.X + request.Y < 0)
+            if (request.X > 0 && request.Y > 0 &&request.X + request.Y < 0)
                 result.Add("Слишком большие числа");
 
             return result;
