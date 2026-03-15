@@ -33,7 +33,6 @@ namespace MyMediator.Types
         {
             var key = (requestType, typeof(TResponse));
 
-            // Используем object в словаре, чтобы избежать проблем с приведением дженериков
             return (Func<IRequest<TResponse>, IServiceProvider, CancellationToken, Task<TResponse>>)
                 _cache.GetOrAdd(key, _ => CreateFactoryDelegate<IRequest<TResponse>, TResponse>(requestType, typeof(TResponse)));
         }
