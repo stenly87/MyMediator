@@ -36,7 +36,14 @@ namespace MediatorUseSample.Controllers
             return Ok();
         }
 
-        [HttpGet("test-exception")]
+        [HttpGet("delay")]
+        public async Task<ActionResult> TestDelay()
+        {
+            await mediator.SendAsync(new TestDelayCommand());
+            return Ok();
+        }
+
+        [HttpGet("exception")]
         public IActionResult TestException()
         {
             throw new InvalidOperationException("Тест!");
