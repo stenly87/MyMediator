@@ -1,8 +1,10 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.VisualBasic;
 using MyMediator.Interfaces;
 using System.Collections.Concurrent;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 
 namespace MyMediator.Types
 {
@@ -10,186 +12,183 @@ namespace MyMediator.Types
     /// Статический класс, реализующий кэширование фабрик пайплайнов обработки запросов.
     /// Позволяет запустить цепочку поведений, связанных с выполнением запросов
     /// </summary>
-    static class PipelineFactoryCache
+    internal static class PipelineFactoryCache
     {
-        /// <summary>
-        /// Кэш делегатов, выполняющих обработку запроса через пайплайн. Ключ - пара: (тип запроса, тип ответа)
-        /// </summary>
-        private static readonly ConcurrentDictionary<(Type RequestType, Type ResponseType), Delegate> _cache = new();
-
-        /// <summary>
-        /// MethodInfo кэшируем один раз при старте приложения
-        /// </summary>
-        private static readonly MethodInfo BuildMethod = typeof(PipelineFactoryCache)
-            .GetMethod(nameof(Build), BindingFlags.Static | BindingFlags.NonPublic)!;
-
-        /// <summary>
-        /// Получает или добавляет в кэш делегат для обработки запроса указанного типа
-        /// </summary>
-        /// <typeparam name="TResponse">Тип результата обработки запроса.</typeparam>
-        /// <param name="requestType">Тип запроса.</param>
-        /// <returns>Делегат, выполняющий обработку запроса через зарегистрированный обработчик и цепочку поведений.</returns>
-        public static Func<IRequest<TResponse>, IServiceProvider, CancellationToken, Task<TResponse>> GetOrAdd<TResponse>(Type requestType)
+        private readonly struct PipelineKey : IEquatable<PipelineKey>
         {
-            var key = (requestType, typeof(TResponse));
+            public readonly Type RequestType;
+            public readonly Type ResponseType;
 
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public PipelineKey(Type requestType, Type responseType)
+            {
+                RequestType = requestType;
+                ResponseType = responseType;
+            }
+
+            // Сравнение по ссылке — Type всегда один и тот же объект
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public bool Equals(PipelineKey other)
+                => RequestType == other.RequestType
+                && ResponseType == other.ResponseType;
+
+            public override bool Equals(object? obj) => obj is PipelineKey k && Equals(k);
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public override int GetHashCode()
+                => RequestType.GetHashCode() * 397 ^ ResponseType.GetHashCode();
+        }
+
+        private sealed class PipelineKeyComparer : IEqualityComparer<PipelineKey>
+        {
+            public static readonly PipelineKeyComparer Instance = new();
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public bool Equals(PipelineKey x, PipelineKey y) => x.Equals(y);
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public int GetHashCode(PipelineKey obj) => obj.GetHashCode();
+        }
+
+        private static readonly ConcurrentDictionary<PipelineKey, Delegate> Cache
+            = new(PipelineKeyComparer.Instance);
+
+        private static readonly MethodInfo GetServiceMethod
+            = typeof(IServiceProvider).GetMethod(nameof(IServiceProvider.GetService))!;
+
+        private static readonly MethodInfo ToArrayMethod
+            = typeof(Enumerable).GetMethod(nameof(Enumerable.ToArray))!;
+
+        private static readonly MethodInfo EmptyMethod
+            = typeof(Enumerable).GetMethod(nameof(Enumerable.Empty))!;
+
+
+        public static Func<IRequest<TResponse>, IServiceProvider, CancellationToken, Task<TResponse>>
+            GetOrAdd<TResponse>(Type requestType)
+        {
+            // ▸ Старое: _cache.GetOrAdd((requestType, typeof(TResponse)), ...)  — 1 alloc/вызов
+            // ▸ Новое:  _cache.GetOrAdd(new PipelineKey(...), ...)               — 0 alloc/вызов
             return (Func<IRequest<TResponse>, IServiceProvider, CancellationToken, Task<TResponse>>)
-                _cache.GetOrAdd(key, _ => CreateFactoryDelegate<IRequest<TResponse>, TResponse>(requestType, typeof(TResponse)));
+                Cache.GetOrAdd(new PipelineKey(requestType, typeof(TResponse)),
+                               static key => Build(key.RequestType, key.ResponseType));
         }
 
-        /// <summary>
-        /// Создаем делегат через Expression Tree вместо Invoke
-        /// </summary>
-        /// <typeparam name="T">IRequest<TResponse></typeparam>
-        /// <typeparam name="V">TResponse</typeparam>
-        /// <param name="requestType">Тип запроса.</param>
-        /// <param name="responseType">Тип результата обработки запроса.</param>
-        /// <returns></returns>
-        private static Delegate CreateFactoryDelegate<T, V>(Type requestType, Type responseType)
+
+        private static Delegate Build(Type requestType, Type responseType)
         {
-            // 1. Замыкаем MethodInfo с конкретными типами (Build<TRequest, TResponse>)
-            var genericMethod = BuildMethod.MakeGenericMethod(requestType, responseType);
+            var buildMethod = typeof(PipelineFactoryCache)
+                .GetMethod(nameof(BuildTyped), BindingFlags.Static | BindingFlags.NonPublic)!
+                .MakeGenericMethod(requestType, responseType);
 
-            // 2. Создаем выражение вызова: Build<TRequest, TResponse>()
-            var callExpression = Expression.Call(genericMethod);
-
-            // 3. Оборачиваем в лямбду без параметров: () => Build<TRequest, TResponse>()
-            var lambda = Expression.Lambda<Func<Func<T, IServiceProvider, CancellationToken, Task<V>>>>(
-                callExpression
-            );
-
-            // 4. Компилируем и сразу выполняем один раз, чтобы получить итоговый пайплайн
-            return lambda.Compile()();
+            // Прямой вызов BuildTyped<TReq, TRes>() через MethodInfo.
+            // НЕ Expression.Lambda(() => BuildTyped()).Compile()() — это лишний delegate.
+            return (Delegate)buildMethod.Invoke(null, null)!;
         }
 
-        /// <summary>
-        /// Строит выражение для выполнения пайплайна: разрешение зависимостей, 
-        /// проверка хендлера, обёртывание поведениями и выполнение.
-        /// </summary>
-        /// <typeparam name="TRequest"></typeparam>
-        /// <typeparam name="TResponse"></typeparam>
-        /// <returns></returns>
-        private static Func<IRequest<TResponse>, IServiceProvider, CancellationToken, Task<TResponse>> Build<TRequest, TResponse>()
-            where TRequest : IRequest<TResponse>
+        private static Func<IRequest<TRes>, IServiceProvider, CancellationToken, Task<TRes>>
+            BuildTyped<TReq, TRes>()
+            where TReq : IRequest<TRes>
         {
-            // 1. Создаем инвокеры (они уже скомпилированы в отдельных методах)
-            var handlerInvoker = CreateHandlerInvoker<TRequest, TResponse>();
-            var behaviorInvoker = CreateBehaviorInvoker<TRequest, TResponse>();
+            // ── Делегаты создаются ОДИН раз при старте (кэшируются в замыкании лямбды) ──
 
-            // 2. Определяем параметры входящей лямбды
-            var requestObjParam = Expression.Parameter(typeof(IRequest<TResponse>), "requestObj");
+            var handlerInvoker = CreateHandlerInvoker<TReq, TRes>();
+            var behaviorInvoker = CreateBehaviorInvoker<TReq, TRes>();
+
+            // ── Expression Tree ──
+
+            var requestObjParam = Expression.Parameter(typeof(IRequest<TRes>), "requestObj");
             var spParam = Expression.Parameter(typeof(IServiceProvider), "sp");
             var ctParam = Expression.Parameter(typeof(CancellationToken), "ct");
 
-            // 3. Определяем локальные переменные для блока
-            var requestVar = Expression.Variable(typeof(TRequest), "request");
-            var handlerVar = Expression.Variable(typeof(IRequestHandler<TRequest, TResponse>), "handler");
-            var behaviorsVar = Expression.Variable(typeof(IPipelineBehavior<TRequest, TResponse>[]), "behaviors");
+            var requestVar = Expression.Variable(typeof(TReq), "request");
+            var handlerVar = Expression.Variable(typeof(IRequestHandler<TReq, TRes>), "handler");
+            var behaviorsVar = Expression.Variable(typeof(IPipelineBehavior<TReq, TRes>[]), "behaviors");
 
-            // Методы рефлексии для IServiceProvier и Array
-            var getServiceMethod = typeof(IServiceProvider).GetMethod(nameof(IServiceProvider.GetService))!;
-            var toArrayMethod = typeof(Enumerable).GetMethod(nameof(Enumerable.ToArray))!
-                .MakeGenericMethod(typeof(IPipelineBehavior<TRequest, TResponse>));
-            var emptyMethod = typeof(Enumerable).GetMethod(nameof(Enumerable.Empty))!
-                .MakeGenericMethod(typeof(IPipelineBehavior<TRequest, TResponse>));
+            // 1. request = (TReq)requestObj
+            var castRequest = Expression.Assign(requestVar,
+                Expression.Convert(requestObjParam, typeof(TReq)));
 
-            // 4. Формируем выражения для получения зависимостей
-            // cast: (TRequest)requestObj
-            var assignRequest = Expression.Assign(requestVar, Expression.Convert(requestObjParam, typeof(TRequest)));
-
-            // get handler
-            var assignHandler = Expression.Assign(
-                handlerVar,
+            // 2. handler = (IRequestHandler<TReq, TRes>)sp.GetService(typeof(...))
+            var assignHandler = Expression.Assign(handlerVar,
                 Expression.Convert(
-                    Expression.Call(spParam, getServiceMethod, Expression.Constant(typeof(IRequestHandler<TRequest, TResponse>))),
-                    typeof(IRequestHandler<TRequest, TResponse>)
-                )
-            );
+                    Expression.Call(spParam, GetServiceMethod,
+                        Expression.Constant(typeof(IRequestHandler<TReq, TRes>))),
+                    typeof(IRequestHandler<TReq, TRes>)));
 
-            // check handler != null
+            // 3. if (handler == null) throw
             var handlerNullCheck = Expression.IfThen(
-                Expression.Equal(handlerVar, Expression.Constant(null, typeof(IRequestHandler<TRequest, TResponse>))),
+                Expression.Equal(handlerVar,
+                    Expression.Constant(null, typeof(IRequestHandler<TReq, TRes>))),
                 Expression.Throw(
                     Expression.New(
-                        typeof(InvalidOperationException).GetConstructor(new[] { typeof(string) })!,
-                        Expression.Constant($"Handler for {typeof(TRequest)} not registered.")
-                    )
-                )
-            );
+                        typeof(InvalidOperationException)
+                            .GetConstructor(new[] { typeof(string) })!,
+                        Expression.Constant($"Handler for {typeof(TReq).Name} not registered."))));
 
-            // get behaviors
-            var behaviorsServiceType = typeof(IEnumerable<IPipelineBehavior<TRequest, TResponse>>);
-            var assignBehaviors = Expression.Assign(
-                behaviorsVar,
+            // 4. behaviors = ToArray(sp.GetService(IEnumerable<...>) ?? Empty())
+            var behaviorsServiceType = typeof(IEnumerable<IPipelineBehavior<TReq, TRes>>);
+            var toArrayClosed = ToArrayMethod.MakeGenericMethod(typeof(IPipelineBehavior<TReq, TRes>));
+            var emptyClosed = EmptyMethod.MakeGenericMethod(typeof(IPipelineBehavior<TReq, TRes>));
+
+            var assignBehaviors = Expression.Assign(behaviorsVar,
                 Expression.Convert(
-                    Expression.Call(
-                        toArrayMethod,
+                    Expression.Call(toArrayClosed,
                         Expression.Coalesce(
                             Expression.Convert(
-                                Expression.Call(spParam, getServiceMethod, Expression.Constant(behaviorsServiceType)),
-                                behaviorsServiceType
-                            ),
-                            Expression.Call(emptyMethod)
-                        )
-                    ),
-                    typeof(IPipelineBehavior<TRequest, TResponse>[])
-                )
-            );
+                                Expression.Call(spParam, GetServiceMethod,
+                                    Expression.Constant(behaviorsServiceType)),
+                                behaviorsServiceType),
+                            Expression.Convert(
+                                Expression.Call(emptyClosed),
+                                behaviorsServiceType))),
+                    typeof(IPipelineBehavior<TReq, TRes>[])));
 
-            // компилирование итогов
-            var compiledLambda = Expression.Lambda<Func<IRequest<TResponse>, IServiceProvider, CancellationToken, Task<TResponse>>>(
-                Expression.Block(
-                    typeof(Task<TResponse>),
-                    new[] { requestVar, handlerVar, behaviorsVar },
-                    assignRequest,
-                    assignHandler,
-                    handlerNullCheck,
-                    assignBehaviors,
-                    // Вызов вспомогательного метода, который делает цикл
-                    Expression.Call(
-                        typeof(PipelineFactoryCache).GetMethod(nameof(ExecutePipeline), BindingFlags.Static | BindingFlags.NonPublic)!
-                        .MakeGenericMethod(typeof(TRequest), typeof(TResponse)),
-                        behaviorsVar,
-                        requestVar,
-                        handlerVar,
-                        Expression.Constant(handlerInvoker),
-                        Expression.Constant(behaviorInvoker),
-                        ctParam
-                    )
-                ),
-                requestObjParam,
-                spParam,
-                ctParam
-            );
+            // 5. ExecutePipeline(behaviors, request, handler, handlerInvoker, behaviorInvoker, ct)
+            //
+            //    ▸ handlerInvoker / behaviorInvoker — Expression.Constant(Delegate)
+            //      Expression compiler загружает делегат из замыкания (поле) и передаёт
+            //      как аргумент в ExecutePipeline. ExecutePipeline вызывает их через
+            //      обычный delegate.Invoke() — НЕ DynamicInvoke.
+            //
+            //    ▸ Expression.Call(MethodInfo, ...) — компилируется в прямой call IL.
+            //
+            var execMethod = typeof(PipelineFactoryCache)
+                .GetMethod(nameof(ExecutePipeline), BindingFlags.Static | BindingFlags.NonPublic)!
+                .MakeGenericMethod(typeof(TReq), typeof(TRes));
 
-            return compiledLambda.Compile();
+            var callExec = Expression.Call(execMethod,
+                behaviorsVar,
+                requestVar,
+                handlerVar,
+                Expression.Constant(handlerInvoker),     // ← делегат, созданный ОДИН раз
+                Expression.Constant(behaviorInvoker),    // ← делегат, созданный ОДИН раз
+                ctParam);
+
+            var body = Expression.Block(typeof(Task<TRes>),
+                new[] { requestVar, handlerVar, behaviorsVar },
+                castRequest, assignHandler, handlerNullCheck, assignBehaviors, callExec);
+
+            return Expression
+                .Lambda<Func<IRequest<TRes>, IServiceProvider, CancellationToken, Task<TRes>>>(
+                    body, requestObjParam, spParam, ctParam)
+                .Compile();
         }
 
-        /// <summary>
-        /// Вспомогательный метод, вынесенный из лямбды, чтобы избежать замыканий
-        /// </summary>
-        /// <typeparam name="TRequest"></typeparam>
-        /// <typeparam name="TResponse"></typeparam>
-        /// <param name="behaviors"></param>
-        /// <param name="request"></param>
-        /// <param name="handler"></param>
-        /// <param name="handlerInvoker"></param>
-        /// <param name="behaviorInvoker"></param>
-        /// <param name="ct"></param>
-        /// <returns></returns>
-        private static Task<TResponse> ExecutePipeline<TRequest, TResponse>(
-            IPipelineBehavior<TRequest, TResponse>[] behaviors,
-            TRequest request,
-            IRequestHandler<TRequest, TResponse> handler,
-            Func<IRequestHandler<TRequest, TResponse>, TRequest, CancellationToken, Task<TResponse>> handlerInvoker,
-            Func<IPipelineBehavior<TRequest, TResponse>, TRequest, RequestHandlerDelegate<TResponse>, CancellationToken, Task<TResponse>> behaviorInvoker,
+        // Замыкания в цикле аллоцируются на каждый вызов (~100 байт × N поведений).
+        // Это неизбежно при делегатном подходе, но стоимость мала:
+        // Gen0 collection бесплатна для таких объектов.
+        private static Task<TRes> ExecutePipeline<TReq, TRes>(
+            IPipelineBehavior<TReq, TRes>[] behaviors,
+            TReq request,
+            IRequestHandler<TReq, TRes> handler,
+            Func<IRequestHandler<TReq, TRes>, TReq, CancellationToken, Task<TRes>> handlerInvoker,
+            Func<IPipelineBehavior<TReq, TRes>, TReq,
+                RequestHandlerDelegate<TRes>, CancellationToken, Task<TRes>> behaviorInvoker,
             CancellationToken ct)
-            where TRequest : IRequest<TResponse>
+            where TReq : IRequest<TRes>
         {
-            RequestHandlerDelegate<TResponse> next = () => handlerInvoker(handler, request, ct);
+            RequestHandlerDelegate<TRes> next = () => handlerInvoker(handler, request, ct);
 
-            // Цикл остался здесь, но замыкания теперь создаются только на переменные цикла,
-            // а не на внешний контекст лямбды (request, ct уже захвачены методом)
             for (int i = behaviors.Length - 1; i >= 0; i--)
             {
                 var behavior = behaviors[i];
@@ -200,39 +199,32 @@ namespace MyMediator.Types
             return next();
         }
 
-        /// <summary>
-        /// Создаёт скомпилированный делегат для вызова метода 'HandleAsync' у обработчика запроса (IRequestHandler)"/>
-        /// Использует Expression Trees для генерации эффективного вызова без рефлексии во время выполнения.
-        /// </summary>
-        /// <typeparam name="TRequest">Тип запроса.</typeparam>
-        /// <typeparam name="TResponse">Тип результата обработки запроса.</typeparam>
-        /// <returns>Делегат, вызывающий 'HandleAsync' у обработчика запроса.</returns>
-        private static Func<IRequestHandler<TRequest, TResponse>, TRequest, CancellationToken, Task<TResponse>>
-            CreateHandlerInvoker<TRequest, TResponse>() where TRequest : IRequest<TResponse>
+        // ─── Скомпилированные инвокеры — вызываются один раз
+        private static Func<IRequestHandler<TReq, TRes>, TReq, CancellationToken, Task<TRes>>
+            CreateHandlerInvoker<TReq, TRes>() where TReq : IRequest<TRes>
         {
-            var h = Expression.Parameter(typeof(IRequestHandler<TRequest, TResponse>), "h");
-            var r = Expression.Parameter(typeof(TRequest), "r");
+            var h = Expression.Parameter(typeof(IRequestHandler<TReq, TRes>), "h");
+            var r = Expression.Parameter(typeof(TReq), "r");
             var c = Expression.Parameter(typeof(CancellationToken), "c");
-            var call = Expression.Call(h, nameof(IRequestHandler<TRequest, TResponse>.HandleAsync), null, r, c);
-            return Expression.Lambda<Func<IRequestHandler<TRequest, TResponse>, TRequest, CancellationToken, Task<TResponse>>>(call, h, r, c).Compile();
+            return Expression.Lambda<
+                Func<IRequestHandler<TReq, TRes>, TReq, CancellationToken, Task<TRes>>>(
+                Expression.Call(h, nameof(IRequestHandler<TReq, TRes>.HandleAsync), null, r, c),
+                h, r, c).Compile();
         }
 
-        /// <summary>
-        /// Создаёт скомпилированный делегат для вызова метода 'HandleAsync' у обработчика запроса (IPipelineBehavior)"/>
-        /// Использует Expression Trees для генерации эффективного вызова без рефлексии во время выполнения.
-        /// </summary>
-        /// <typeparam name="TRequest">Тип запроса.</typeparam>
-        /// <typeparam name="TResponse">Тип результата обработки запроса.</typeparam>
-        /// <returns>Делегат, вызывающий 'HandleAsync' у обработчика запроса.</returns>
-        private static Func<IPipelineBehavior<TRequest, TResponse>, TRequest, RequestHandlerDelegate<TResponse>, CancellationToken, Task<TResponse>>
-            CreateBehaviorInvoker<TRequest, TResponse>() where TRequest : IRequest<TResponse>
+        private static Func<IPipelineBehavior<TReq, TRes>, TReq,
+                RequestHandlerDelegate<TRes>, CancellationToken, Task<TRes>>
+            CreateBehaviorInvoker<TReq, TRes>() where TReq : IRequest<TRes>
         {
-            var b = Expression.Parameter(typeof(IPipelineBehavior<TRequest, TResponse>), "b");
-            var r = Expression.Parameter(typeof(TRequest), "r");
-            var n = Expression.Parameter(typeof(RequestHandlerDelegate<TResponse>), "n");
+            var b = Expression.Parameter(typeof(IPipelineBehavior<TReq, TRes>), "b");
+            var r = Expression.Parameter(typeof(TReq), "r");
+            var n = Expression.Parameter(typeof(RequestHandlerDelegate<TRes>), "n");
             var c = Expression.Parameter(typeof(CancellationToken), "c");
-            var call = Expression.Call(b, nameof(IPipelineBehavior<TRequest, TResponse>.HandleAsync), null, r, n, c);
-            return Expression.Lambda<Func<IPipelineBehavior<TRequest, TResponse>, TRequest, RequestHandlerDelegate<TResponse>, CancellationToken, Task<TResponse>>>(call, b, r, n, c).Compile();
+            return Expression.Lambda<
+                Func<IPipelineBehavior<TReq, TRes>, TReq,
+                    RequestHandlerDelegate<TRes>, CancellationToken, Task<TRes>>>(
+                Expression.Call(b, nameof(IPipelineBehavior<TReq, TRes>.HandleAsync), null, r, n, c),
+                b, r, n, c).Compile();
         }
     }
 }
